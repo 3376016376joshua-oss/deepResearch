@@ -48,6 +48,45 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"定时任务调度器启动失败: {e}")
 
+    # DeepScout 本地 SFT adapter warm-up：避免首条请求懒加载延迟
+    # 关闭条件（任一满足即跳过）：
+    #   - DEEPSCOUT_WARMUP=0
+    #   - DEEPSCOUT_USE_LOCAL_SFT=0
+    #   - 无 CUDA 且未显式 DEEPSCOUT_WARMUP=1（CPU 加载 7B fp32 ~28GB RAM，分钟级阻塞启动）
+    import os
+    warmup_env = os.getenv("DEEPSCOUT_WARMUP", "").strip().lower()
+    # 默认 0：首发只用 DashScope，避免无 GPU 环境误加载 7B 模型阻塞启动
+    use_local_flag = os.getenv("DEEPSCOUT_USE_LOCAL_SFT", "0").strip().lower()
+    provider = "local_sft" if use_local_flag in {"1", "true", "yes", "on"} else "dashscope"
+    logger.info(f"[startup] LLM provider = {provider}")
+
+    def _has_cuda() -> bool:
+        try:
+            import torch
+            return bool(torch.cuda.is_available())
+        except Exception:
+            return False
+
+    if warmup_env in {"1", "true", "yes", "on"}:
+        warmup_enabled = True
+    elif warmup_env in {"0", "false", "no", "off"}:
+        warmup_enabled = False
+    else:
+        warmup_enabled = _has_cuda()  # 默认：仅在有 GPU 时 warm-up
+
+    if warmup_enabled and use_local_flag not in {"0", "false", "no", "off"}:
+        try:
+            import asyncio
+            from service.deep_research_v2.agents.base import BaseAgent
+            await asyncio.to_thread(BaseAgent._load_deepscout_local_model, logger)
+            logger.info("DeepScout 本地模型 warm-up 完成")
+        except Exception as e:
+            logger.warning(f"DeepScout 本地模型 warm-up 失败（运行时将自动回退远程 API）: {e}")
+    else:
+        logger.info(
+            "DeepScout warm-up 跳过（无 CUDA 或被显式关闭），首次请求时懒加载或回退远程 API"
+        )
+
     yield
 
     # 关闭时执行
@@ -68,12 +107,17 @@ app = FastAPI(
 )
 
 # 添加 CORS 中间件
+import os as _os
+_cors_origins_env = _os.getenv("CORS_ORIGINS", "*").strip()
+_allow_origins = ["*"] if _cors_origins_env in ("", "*") else [
+    o.strip() for o in _cors_origins_env.split(",") if o.strip()
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 允许所有源，生产环境中应该设置具体的源
+    allow_origins=_allow_origins,
     allow_credentials=True,
-    allow_methods=["*"],  # 允许所有方法
-    allow_headers=["*"],  # 允许所有头
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # 注册路由

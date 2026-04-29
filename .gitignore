@@ -21,6 +21,9 @@ yarn-error.log*
 .env
 .env.local
 .env.*.local
+.env.prod
+backend/.env.prod
+!backend/.env.prod.example
 
 # IDE
 .idea/
@@ -47,3 +50,7 @@ langfuse/
 .cache/
 *.cache
 USER_ACTION.md
+
+# DeepScout SFT 训练日志与 LoRA adapter
+backend/data/deepscout_logs/
+backend/app/service/deep_research_v2/sft/

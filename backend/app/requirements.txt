@@ -1,3 +1,6 @@
+# 生产基线依赖（DashScope-only 模式）。
+# SFT 训练相关（torch / transformers / peft / bitsandbytes ...）放在 backend/scripts/requirements.txt，
+# 仅在 GPU worker 镜像中安装，主生产镜像不带。
 fastapi==0.115.0
 fastapi-jwt[authlib]==0.3.0
 uvicorn==0.31.0
@@ -40,3 +43,11 @@ dashscope
 apscheduler>=3.10.0
 sqlalchemy>=2.0.0
 psycopg2-binary>=2.9.0
+redis>=5.0.0
+python-jose[cryptography]>=3.3.0
+bcrypt>=4.0.0
+email-validator>=2.0.0
+numpy>=1.24.0
+alibabacloud_docmind_api20220711>=1.0.0
+alibabacloud_tea_openapi>=0.3.0
+alibabacloud_tea_util>=0.3.0
