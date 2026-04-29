@@ -11,12 +11,17 @@ import json
 import logging
 import asyncio
 import time
+import os
 from abc import ABC, abstractmethod
 from typing import Dict, Any, Optional, List, Union
 from datetime import datetime
+from pathlib import Path
 from openai import OpenAI
 
 from ..state import ResearchState, AgentLog
+
+# 配置要记录训练数据的 Agent
+TARGET_TRAINING_AGENTS = {"DeepScout", "DataAnalyst"}
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(name)s: %(message)s')
 
@@ -27,6 +32,9 @@ class BaseAgent(ABC):
 
     所有专家Agent继承此类，实现特定的 process 方法。
     """
+    # DeepScout 本地 SFT 模型缓存（避免重复加载）
+    _deepscout_local_bundle: Optional[Dict[str, Any]] = None
+    _deepscout_local_load_error: Optional[str] = None
 
     def __init__(
         self,
@@ -41,6 +49,145 @@ class BaseAgent(ABC):
         self.model = model
         self.client = OpenAI(api_key=llm_api_key, base_url=llm_base_url)
         self.logger = logging.getLogger(f"Agent.{name}")
+
+    def _get_deepscout_adapter_path(self) -> Path:
+        """
+        获取 DeepScout SFT adapter 路径。
+        默认路径：backend/app/service/deep_research_v2/sft
+        可通过 DEEPSCOUT_SFT_PATH 覆盖。
+        """
+        default_path = Path(__file__).resolve().parents[1] / "sft"
+        path_str = os.getenv("DEEPSCOUT_SFT_PATH", str(default_path))
+        return Path(path_str).expanduser().resolve()
+
+    def _should_use_deepscout_local_model(self) -> bool:
+        """
+        是否启用 DeepScout 本地模型（HF base + 本地 adapter）。
+        默认关闭：首发只用 DashScope；GPU 环境显式 DEEPSCOUT_USE_LOCAL_SFT=1 才启用。
+        """
+        if self.name != "DeepScout":
+            return False
+        flag = os.getenv("DEEPSCOUT_USE_LOCAL_SFT", "0").strip().lower()
+        return flag in {"1", "true", "yes", "on"}
+
+    @classmethod
+    def _load_deepscout_local_model(cls, logger: logging.Logger) -> Dict[str, Any]:
+        """
+        懒加载 DeepScout 本地模型（仅首次调用加载）。
+        """
+        if cls._deepscout_local_bundle is not None:
+            return cls._deepscout_local_bundle
+        if cls._deepscout_local_load_error:
+            raise RuntimeError(cls._deepscout_local_load_error)
+
+        try:
+            import torch
+            from transformers import AutoModelForCausalLM, AutoTokenizer
+            from peft import PeftModel
+
+            base_model_name = os.getenv("DEEPSCOUT_BASE_MODEL", "Qwen/Qwen2.5-7B-Instruct")
+            adapter_path = os.getenv("DEEPSCOUT_SFT_PATH", "")
+            if not adapter_path:
+                default_path = Path(__file__).resolve().parents[1] / "sft"
+                adapter_path = str(default_path)
+
+            adapter_dir = Path(adapter_path).expanduser().resolve()
+            if not adapter_dir.exists():
+                raise FileNotFoundError(f"DeepScout SFT adapter path not found: {adapter_dir}")
+
+            logger.info(f"[DeepScout] Loading base model from HuggingFace: {base_model_name}")
+            logger.info(f"[DeepScout] Loading LoRA adapter from: {adapter_dir}")
+
+            use_cuda = torch.cuda.is_available()
+            torch_dtype = torch.float16 if use_cuda else torch.float32
+
+            tokenizer = AutoTokenizer.from_pretrained(base_model_name, trust_remote_code=True)
+            if tokenizer.pad_token_id is None:
+                tokenizer.pad_token = tokenizer.eos_token
+
+            base_model = AutoModelForCausalLM.from_pretrained(
+                base_model_name,
+                trust_remote_code=True,
+                torch_dtype=torch_dtype
+            )
+            model = PeftModel.from_pretrained(base_model, str(adapter_dir))
+            model.eval()
+            if use_cuda:
+                model = model.cuda()
+
+            cls._deepscout_local_bundle = {
+                "model": model,
+                "tokenizer": tokenizer,
+                "base_model_name": base_model_name,
+                "adapter_dir": str(adapter_dir)
+            }
+            logger.info("[DeepScout] Local base+adapter model loaded successfully")
+            return cls._deepscout_local_bundle
+        except Exception as e:
+            cls._deepscout_local_load_error = f"Failed to load local DeepScout model: {e}"
+            logger.error(cls._deepscout_local_load_error)
+            raise
+
+    def _call_deepscout_local_model_sync(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        json_mode: bool,
+        temperature: float,
+        max_tokens: int
+    ) -> str:
+        """
+        同步调用 DeepScout 本地模型（在 to_thread 中执行）。
+        """
+        bundle = self._load_deepscout_local_model(self.logger)
+        model = bundle["model"]
+        tokenizer = bundle["tokenizer"]
+
+        final_user_prompt = user_prompt
+        if json_mode:
+            # 对齐原 call_llm 的 json_mode 行为：尽量只输出 JSON 对象
+            final_user_prompt = f"{user_prompt}\n\n请仅输出一个合法的JSON对象，不要输出任何额外说明。"
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": final_user_prompt}
+        ]
+        input_ids = tokenizer.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=True,
+            return_tensors="pt"
+        )
+
+        # 仅生成合理上限，避免本地推理过慢或 OOM
+        local_max_new_tokens = int(os.getenv("DEEPSCOUT_LOCAL_MAX_NEW_TOKENS", "2048"))
+        max_new_tokens = max(1, min(max_tokens, local_max_new_tokens))
+
+        if hasattr(model, "device"):
+            input_ids = input_ids.to(model.device)
+
+        do_sample = temperature > 0.01
+        generate_kwargs = {
+            "max_new_tokens": max_new_tokens,
+            "do_sample": do_sample,
+            "pad_token_id": tokenizer.pad_token_id,
+            "eos_token_id": tokenizer.eos_token_id
+        }
+        if do_sample:
+            generate_kwargs["temperature"] = max(temperature, 0.01)
+            generate_kwargs["top_p"] = 0.9
+
+        output_ids = model.generate(input_ids, **generate_kwargs)
+        generated_ids = output_ids[0][input_ids.shape[1]:]
+        output_text = tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+
+        if json_mode:
+            # 尽量返回规范 JSON 字符串，减少下游解析问题
+            parsed = self.parse_json_response(output_text)
+            if parsed:
+                return json.dumps(parsed, ensure_ascii=False)
+
+        return output_text
 
     @abstractmethod
     async def process(self, state: ResearchState) -> ResearchState:
@@ -78,7 +225,52 @@ class BaseAgent(ABC):
         """
         start_time = time.time()
 
+        # 准备日志数据
+        log_data = {
+            "timestamp": datetime.now().isoformat(),
+            "agent": self.name,
+            "model": self.model,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "system_prompt": system_prompt,
+            "user_prompt": user_prompt
+        }
+
         try:
+            # DeepScout 优先使用本地 HF base + SFT adapter；失败时自动回退远程 API
+            if self._should_use_deepscout_local_model():
+                adapter_path = self._get_deepscout_adapter_path()
+                if adapter_path.exists():
+                    try:
+                        content = await asyncio.to_thread(
+                            self._call_deepscout_local_model_sync,
+                            system_prompt,
+                            user_prompt,
+                            json_mode,
+                            temperature,
+                            max_tokens
+                        )
+                        duration = int((time.time() - start_time) * 1000)
+                        self.logger.info(
+                            f"Local DeepScout model call completed in {duration}ms, response length: {len(content)}"
+                        )
+
+                        if self.name in TARGET_TRAINING_AGENTS:
+                            log_data["response"] = content
+                            log_data["duration_ms"] = duration
+                            log_data["inference_mode"] = "local_sft"
+                            self._save_training_log(log_data)
+
+                        return content
+                    except Exception as local_e:
+                        self.logger.warning(
+                            f"Local DeepScout inference failed, fallback to API call: {local_e}"
+                        )
+                else:
+                    self.logger.info(
+                        f"DeepScout local adapter not found at {adapter_path}, fallback to API model."
+                    )
+
             kwargs = {
                 "model": self.model,
                 "messages": [
@@ -102,11 +294,42 @@ class BaseAgent(ABC):
 
             self.logger.info(f"LLM call completed in {duration}ms, response length: {len(content)}")
 
+            # 记录训练数据
+            if self.name in TARGET_TRAINING_AGENTS:
+                log_data["response"] = content
+                log_data["duration_ms"] = duration
+                self._save_training_log(log_data)
+
             return content
 
         except Exception as e:
             self.logger.error(f"LLM call failed: {e}")
+
+            # 记录失败的请求
+            if self.name in TARGET_TRAINING_AGENTS:
+                log_data["error"] = str(e)
+                self._save_training_log(log_data)
+
             raise
+
+    def _save_training_log(self, log_data: dict) -> None:
+        """保存训练数据到 JSONL 文件
+
+        默认路径：backend/data/deepscout_logs/
+        可通过 DEEPSCOUT_LOG_DIR 覆盖。
+        """
+        try:
+            default_log_dir = Path(__file__).resolve().parents[4] / "data" / "deepscout_logs"
+            log_dir = Path(os.getenv("DEEPSCOUT_LOG_DIR", str(default_log_dir))).expanduser()
+            log_dir.mkdir(parents=True, exist_ok=True)
+            log_file = log_dir / f"llm_calls_{datetime.now().strftime('%Y%m%d')}.jsonl"
+
+            with open(log_file, "a", encoding="utf-8") as f:
+                f.write(json.dumps(log_data, ensure_ascii=False) + "\n")
+
+            self.logger.debug(f"Training log saved to {log_file}")
+        except Exception as e:
+            self.logger.warning(f"Failed to save training log: {e}")
 
     def parse_json_response(self, response: str) -> Dict[str, Any]:
         """安全解析JSON响应，处理markdown代码块和格式问题"""

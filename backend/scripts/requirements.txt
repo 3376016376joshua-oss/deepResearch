@@ -1,0 +1,24 @@
+# DeepScout LoRA 训练依赖（GPU-only，云端使用）
+#
+# 安装：
+#   pip install -r scripts/requirements.txt
+#
+# 注意：torch 必须装与 CUDA 版本匹配的 GPU 构建。
+# autodl/runpod 镜像通常已自带 torch；若没有，按 CUDA 版本去
+# https://pytorch.org/get-started/locally/ 拿对应安装命令再单装。
+
+unsloth>=2024.8
+trl>=0.9.0
+transformers>=4.43
+datasets>=2.19
+peft>=0.11
+accelerate>=0.30
+bitsandbytes>=0.43        # 4bit 量化加载
+sentencepiece             # Qwen tokenizer 依赖
+protobuf>=3.20            # tokenizer 解析
+xformers                  # unsloth 性能加速（可选但强烈建议）
+
+# 训练脚本自身只需上面这些。
+# 如要在云端同时跑 PT 数据生成（build_pt_data.py --source self-replay），
+# 还需要：
+#   openai>=1.0

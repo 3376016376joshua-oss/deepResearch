@@ -132,20 +132,22 @@ SAMPLE_TOPICS = [
 
 
 # ============ 配置 ============
-OUTPUT_DIR = Path("/tmp/deepscout_training_data/distilled")
+DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parents[1] / "data" / "deepscout_logs" / "distilled"
+OUTPUT_DIR = Path(os.getenv("DEEPSCOUT_DISTILL_OUTPUT", str(DEFAULT_OUTPUT_DIR)))
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-# qwen-max API 配置
+# Teacher 模型配置：默认升级到 qwen-max-latest，可通过 DEEPSCOUT_TEACHER_MODEL 覆盖
 DASHSCOPE_API_KEY = os.getenv("DASHSCOPE_API_KEY", "")
-LLM_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-MODEL_NAME = "qwen-max"
+LLM_BASE_URL = os.getenv("DEEPSCOUT_TEACHER_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
+MODEL_NAME = os.getenv("DEEPSCOUT_TEACHER_MODEL", "qwen-max-latest")
 
-# 数据量目标
+# 数据量目标：按线上调用频率配比 5 : 2 : 2 : 1
+# (search_analysis : supplementary : deep_search : deep_read)，总量 1200
 TARGET_COUNTS = {
-    "search_analysis": 500,
-    "deep_read": 300,
-    "supplementary_search": 200,
-    "deep_search": 200,
+    "search_analysis": 600,
+    "supplementary_search": 240,
+    "deep_search": 240,
+    "deep_read": 120,
 }
 
 # 数据混合配置（可通过环境变量覆盖）
@@ -1059,7 +1061,7 @@ async def main():
     save_distilled_data(all_data)
 
     print("\n下一步:")
-    print("1. 查看生成的数据: ls /tmp/deepscout_training_data/distilled/")
+    print(f"1. 查看生成的数据: ls {OUTPUT_DIR}")
     print("2. 运行 export_training_data.py 转换为 LoRA 训练格式")
     print("3. 运行 train_lora.py 开始微调")
 
